@@ -1,175 +1,648 @@
-# Customer Agent — Implemented Changes and File Guide
+# Customer Agent — Implementation Explanation Guide
 
-This is a short, current-state list of the work implemented in the backend and
-frontend development branches. It is grouped by feature so it can be explained
-quickly during a developer review.
+This document explains the implemented work in simple Hinglish. Each item gives
+the reason, exact files, current code reference, and a short explanation that can
+be used during a client or developer review.
 
-## 1. Backend orchestration and interview flow
+## How to use this document
 
-| Files changed | What we changed |
-|---|---|
-| `DataHandling/server.py` | Hardened the main REST/WebSocket flow, isolated each connection's agent state, added safe start/resume/new-attempt handling, moved blocking work away from the async event loop, improved persistence, upload handling, clinical escalation, duplicate-request handling, and prompt-leak barriers. |
-| `DataHandling/src/graph/graph.py` | Simplified the primary LangGraph topology and removed unnecessary sequential processing. |
-| `DataHandling/src/graph/edges.py` | Corrected routing between extraction, validation, uploads, questions, summaries, and corrections. |
-| `DataHandling/src/graph/state.py` | Cleaned the shared interview-state contract and removed obsolete correction-routing state. |
-| `DataHandling/src/graph/server_adapter.py` | Kept graph results, progress, attachments, form identity, and WebSocket responses synchronized. |
-| `DataHandling/src/graph/nodes/extract.py` | Combined extraction and intent work, reduced avoidable AI latency, and removed the incorrect normal-answer correction branch. |
-| `DataHandling/src/graph/nodes/first_turn.py` | Improved first-message extraction and routing. |
-| `DataHandling/src/graph/nodes/generate.py` | Improved next-question/summary transitions and deterministic referral handling. |
-| `DataHandling/src/graph/nodes/correction.py` and `nodes/summary.py` | Restricted correction processing to the summary-confirmation flow and improved summary response handling. |
-| `DataHandling/src/graph/pure_functions/form_extraction.py` | Improved structured field extraction, referral extraction, negative answers, corrections, and PROM-safe behavior. |
-| `DataHandling/src/graph/pure_functions/intent_detection.py` | Removed broad keywords such as ordinary “sorry/actually/change” usage from active correction routing, preventing repeated correction messages during normal intake. |
-| `DataHandling/src/graph/pure_functions/reasoning_extractor.py` and `summary.py` | Improved extraction/summary behavior and reduced unsafe or duplicate processing. |
-| `DataHandling/src/llm/functionalities.py` and `src/llm/utils.py` | Reduced the legacy `HealthAgent` implementation, retained it as a fallback, and aligned provider/model handling with the active graph. |
+For any review question, answer in this order:
 
-## 2. Form data, ownership and repeat assessments
+1. **Problem:** Pehle kya risk/problem tha?
+2. **Implementation:** Humne technically kya change kiya?
+3. **Location:** Change kis file/function mein hai?
+4. **Result:** Isse security, reliability, performance ya cost par kya effect hua?
 
-| Files changed/added | What we changed |
-|---|---|
-| `DataHandling/app/db/ownership.py` | Added reusable patient/form ownership checks so one patient cannot load another patient's form. |
-| `DataHandling/app/db/queries.py` | Centralized ObjectId/string-compatible, user-scoped MongoDB queries and prevented broad form updates/deletes. |
-| `DataHandling/app/db/connection.py` and `app/db/mongo.py` | Centralized MongoDB access and enforced TLS certificate/hostname verification. |
-| `DataHandling/app/forms/attempts.py` | Added opaque `attemptId` values and indexes so repeated assessments remain separate. |
-| `DataHandling/app/forms/lifecycle.py` | Added monotonic `draft`, `in_progress`, and `completed` lifecycle rules; only drafts can expire. |
-| `DataHandling/app/forms/progress.py` | Centralized form and section completion calculation. |
-| `DataHandling/app/forms/titles.py` | Replaced an unnecessary AI title request with deterministic form titles. |
-| `DataHandling/app/forms/instruments.py` and `app/forms/prom.py` | Added stable PROM question identity, administered-question snapshots, structured-answer validation, and safe scoring state. |
+Items **1–26** are the Customer Agent hardening and optimization work. Item
+**27 (`context-layer`) was implemented by the earlier developer**; we reviewed
+its integration and documented its role.
 
-## 3. WebSocket, frontend and audio reliability
+---
 
-| Files changed/added | What we changed |
-|---|---|
-| `DataHandling/app/ws/idempotency.py` | Added bounded request-ID tracking so retries do not save or process the same answer twice. |
-| `DataHandling/app/runtime/blocking.py` | Added a bounded thread/executor boundary for synchronous database and provider work. |
-| `DataHandling/app/audio/limits.py` | Added server-side recording duration, chunk, and total-byte limits. |
-| `DataHandling/app/audio/stt.py` | Centralized the audio model, improved fallback handling, moved the Gemini instruction to `system_instruction`, and rejects prompt-contaminated transcripts before returning them. |
-| `DataHandling/app/content_safety.py` | Added deterministic detection and recursive removal of leaked internal transcription instructions. |
-| `../customer-agent-frontend/src/hooks/useWebSocket.ts` | Prevented parallel sockets, cleaned timers/buffers on unmount, stopped unrecoverable reconnect loops, handled duplicate acknowledgements, and aligned messages with the backend contract. |
-| `../customer-agent-frontend/src/hooks/useVoiceRecorder.ts` | Improved MediaRecorder/audio cleanup and bounded recording behavior. |
-| `../customer-agent-frontend/src/components/TranscriptionInterface.tsx` | Prevented auto-send/manual-send duplication, added request IDs, improved voice state cleanup, consent checks, upload behavior, and structured PROM controls. |
+## 1. Backend architecture refactor and organization
 
-## 4. Clinical safety, privacy and observability
+**What and why:** Large `server.py` responsibilities ko small, testable modules
+mein separate kiya. Isse main WebSocket orchestration readable raha aur database,
+forms, uploads, AI, safety and job logic independently test ho sakti hai.
 
-| Files changed/added | What we changed |
-|---|---|
-| `DataHandling/app/clinical/escalation.py` | Added deterministic detection and handling for urgent clinical risk, with a dedicated stop-interview WebSocket response. |
-| `DataHandling/app/observability/privacy.py` | Added pseudonymous identifiers and safe exception-type logging to avoid normal logs containing patient answers or credentials. |
-| `DataHandling/app/observability/ai_usage.py` | Added provider/model/operation call counts, latency, token/audio usage, failures, and estimated-cost metrics. |
-| `DataHandling/app/ai/models.py` | Centralized approved Gemini models, defaults and fallbacks; retired or unapproved model IDs now fail configuration validation. |
-| `DataHandling/app/mcp_client.py` | Made the optional MCP integration safer and kept it out of the required production path. |
+**Main files:**
 
-## 5. Upload and report-processing reliability
+- `DataHandling/server.py` — REST/WebSocket entry and orchestration
+- `DataHandling/src/graph/graph.py` — LangGraph workflow
+- `DataHandling/src/graph/edges.py` — workflow routing
+- `DataHandling/src/graph/nodes/` — individual interview operations
+- `DataHandling/app/` — database, forms, audio, uploads, jobs and safety modules
 
-| Files changed/added | What we changed |
-|---|---|
-| `DataHandling/app/uploads/policy.py` | Added file-count, per-file, total-size, signature/MIME, PDF-page, image-pixel, and image-dimension validation. |
-| `DataHandling/app/uploads/reading.py` | Added bounded streaming reads so an oversized upload is rejected before consuming unlimited memory. |
-| `DataHandling/upload/s3_client.py` | Improved safe S3 upload/download behavior and metadata handling. |
-| `DataHandling/app/jobs/reports.py` | Replaced fragile background-only processing with MongoDB-backed jobs, leases, retries, recovery, and stale-result protection. |
-| `DataHandling/docscanner/service.py` | Added safe PDF/image inspection, bounded rendering, multi-report limits, and stricter model-output handling. |
-| `DataHandling/docscanner/client.py` | Centralized Bedrock configuration, retries and usage monitoring. |
+**Code to show:**
 
-## 6. Frontend configuration, quality and dependency work
-
-| Files changed | What we changed |
-|---|---|
-| `../customer-agent-frontend/src/config/api.ts`, `config/policy.ts`, `utils/api-config.ts` | Centralized API, WebSocket, consent and environment URL validation; added controlled HTTP/IP support for isolated UAT. |
-| `../customer-agent-frontend/vite.config.ts` and `src/vite-env.d.ts` | Added required build-time configuration validation and TypeScript environment definitions. |
-| `../customer-agent-frontend/src/App.tsx`, `pages/Index.tsx`, `pages/ConsentPage.tsx`, `pages/FormSelection.tsx` | Improved patient/form URL routing, consent redirect behavior and form selection. |
-| `../customer-agent-frontend/src/utils/graphql-client.ts` and data hooks | Removed unsafe defaults and aligned configured GraphQL requests. |
-| `../customer-agent-frontend/eslint.config.js` and affected components | Fixed TypeScript/ESLint issues and unsafe loose types. |
-| `../customer-agent-frontend/package.json` and `package-lock.json` | Updated vulnerable dependencies and standardized npm lockfile usage. |
-| `../customer-agent-frontend/.gitignore`, `.dockerignore`, `.vercelignore` | Prevented local environment files, build output and unrelated artifacts from entering deployments/repository history. |
-
-## 7. Deployment and repository cleanup
-
-| Files changed/added | What we changed |
-|---|---|
-| `DataHandling/deployment/Dockerfile` | Changed to a multi-stage, allow-list-based runtime image and removed tests, credentials, local data and build tools from the final image. |
-| `docker-compose.dev-isolated.yml` | Added an isolated backend service/container, port, volumes and network so UAT does not replace the existing production container. |
-| `../customer-agent-frontend/Dockerfile.dev`, `docker-compose.dev-isolated.yml`, `nginx.dev.conf` | Added an isolated production-style frontend build served by Nginx on its own UAT port. |
-| `DataHandling/.env.example` and frontend `.env.example` | Documented required configuration names without committing real secrets. |
-| Root/DataHandling `.gitignore` and `.dockerignore` | Excluded credentials, generated audio/transcripts, reports, caches, local databases and build artifacts. |
-| `DataHandling/deployment/update.sh`, `update-fast.sh`, the temporary token generator, stale output files and unused frontend assets | Removed unsafe, generated or obsolete repository/deployment artifacts. |
-| `DataHandling/requirements.in`, `requirements-docker.txt`, `requirements.txt` | Separated direct dependencies and pinned the reproducible container dependency set. |
-
-## 8. Documentation and tests
-
-| Files changed/added | What we changed |
-|---|---|
-| `README.md` and `DataHandling/docs/README.md` | Replaced outdated architecture descriptions with the current application boundaries. |
-| `DataHandling/docs/PUBLIC_API.md` | Documented current REST/WebSocket messages, form identity and persistence behavior. |
-| `DataHandling/docs/LOCAL_DEV.md` | Added safe local configuration, startup and verification steps. |
-| `DataHandling/docs/DEPLOYMENT.md` and `DEV_ISOLATED_DEPLOYMENT.md` | Added deployment checks and isolated shared-server UAT instructions. |
-| `DataHandling/tests/test_*.py` | Added regression coverage for ownership, query scope, attempts, lifecycle, PROMs, uploads, report jobs, WebSockets, async boundaries, clinical escalation, privacy, model configuration, transcription prompt leakage and interview correction routing. |
-| Frontend build/lint/audit workflow | Verified TypeScript compilation, ESLint, production build and npm dependency audit after the frontend changes. |
-
-## 9. Before vs now — code evidence
-
-The **Before** column is taken from the code immediately before the main
-hardening work (`d7db465^`). The **Now** column shows the active development
-implementation. The snippets are intentionally short so they can be searched
-and opened quickly during a screen-sharing review.
-
-| Area and file | Before | Now | Why the current implementation is needed |
-|---|---|---|---|
-| Form deletion — `DataHandling/server.py` | `delete_one({"formId": existing_form_id})` | `delete_filter = build_owned_form_filter(existing_form, user_id_for_check, existing_form_id)` then `delete_one(delete_filter)` | The old filter was not patient-scoped. The current filter requires the exact document ID, stored patient ID and form ID before deletion. |
-| Form lookup — `DataHandling/server.py`, `app/db/queries.py` | `find_one({"formId": form_id, "userId": _uid})` | `build_user_form_queries(user_id, form_id, attempt_id=attempt_id)` | Centralizes ObjectId/string handling and ensures reads stay inside the requested patient's form/attempt. |
-| Repeat assessments — `server.py`, `app/forms/attempts.py` | Unique identity was only `("userId", "formId")`. | `ATTEMPT_INDEX_KEYS = [("userId", 1), ("formId", 1), ("attemptId", 1)]` | A new assessment now has its own opaque attempt identity instead of overwriting the patient's earlier submission. |
-| Form writes — `DataHandling/server.py` | `{"formId": form_id, "userId": _uid}` | `add_attempt_write_scope({"formId": form_id, "userId": _uid}, attempt_id)` | Updates target one assessment attempt, not every record that shares the form template ID. |
-| Form lifecycle/TTL — `app/db/mongo.py`, `app/forms/lifecycle.py` | TTL was tied to `{"title": "New Form"}` and `createdAt`. | TTL uses `expiresAt` with `partialFilterExpression={"status": DRAFT}`; completed status returns `expires_at=None`. | A title is presentation data, not lifecycle state. Only abandoned drafts can now expire; completed clinical records cannot be deleted by draft cleanup. |
-| Form title cost — `DataHandling/server.py`, `app/forms/titles.py` | `form_title = generate_form_title(form_data_copy)` called the LLM. | `form_title = build_form_title(form_data_copy, empty_title="New Form")` | A deterministic title does not need an AI request, so it reduces latency, cost and failure points. |
-| Normal-answer routing — `src/graph/nodes/extract.py`, `src/graph/edges.py` | `should_check_for_correction(user_input, awaiting_confirmation=False)` could route words such as “actually” into correction mode. | `if intent == "request_change" and correction_text: return "detect_correction"` after summary confirmation. | Correction handling now runs only in the correction context, preventing repeated “I couldn't identify the exact change” responses during normal intake. |
-| Audio prompt handling — `app/audio/stt.py` | `contents=[audio_part, _GEMINI_STT_PROMPT]` sent the internal instruction as ordinary content. | `contents=[audio_part]` with `GenerateContentConfig(system_instruction=_GEMINI_STT_PROMPT, ...)`. | Keeps system instructions separate from patient audio and materially reduces the chance that the model returns the internal prompt as transcript text. |
-| Prompt-leak barrier — `app/audio/stt.py`, `app/content_safety.py`, `server.py` | `return text` accepted the provider transcript directly. | `contains_internal_transcription_prompt(text)` triggers fallback/rejection, and `scrub_internal_transcription_prompts(...)` protects persistence. | A leaked instruction is rejected before display and scrubbed before any form/chat value can enter the clinical record. |
-| AI model selection — `app/audio/stt.py`, `app/ai/models.py` | `model="gemini-2.5-flash"` and other model IDs were spread across modules. | `model=MODEL_REGISTRY.audio`; `MODEL_REGISTRY = build_model_registry(os.environ)` rejects retired/unapproved IDs during import. | One validated registry controls model changes and prevents silent use of inconsistent or retired models. |
-| AI monitoring — provider call sites and `app/observability/ai_usage.py` | Provider methods were called directly, with ad-hoc timing logs. | `tracked_ai_call(provider=..., model=..., operation=..., call=..., usage_extractor=...)` | Records call count, errors, latency, usage and estimated cost using one consistent boundary. |
-| Async database/provider work — `DataHandling/server.py`, `app/runtime/blocking.py` | `asyncio.create_task(asyncio.to_thread(save_customer_info, ...))` was fire-and-forget and used the default executor. | `await run_blocking(save_customer_info, ...)` uses the bounded application executor. | The save completes before success continues, exceptions are observable, and synchronous work cannot create unlimited default-executor pressure. |
-| Duplicate submissions — frontend `useWebSocket.ts`, `TranscriptionInterface.tsx`; backend `app/ws/idempotency.py` | `sendTextInput(text)` had no request identity. | Frontend sends `requestId`; backend calls `_request_window.register(user_id, requestId, questionId)` and returns `submission_ack` for duplicates. | A retry, reconnect or UI race cannot process and persist the same patient answer twice. |
-| WebSocket policy failures — frontend `src/hooks/useWebSocket.ts` | Every non-`1000` close retried after three seconds. | `if (event.code === 4003 \|\| event.code === 1008) shouldReconnectRef.current = false`. | Clinical-stop and policy/authentication failures cannot be fixed by reconnecting, so the current code prevents an endless reconnect loop. |
-| Upload memory safety — `DataHandling/server.py`, `app/uploads/reading.py` | `file_bytes = await file.read()` loaded an unlimited request file into memory. | `file_bytes = await read_upload_bounded(file, max_bytes=read_limit)` followed by `inspect_upload(...)`. | Oversized or invalid input is stopped while streaming, before it can consume unbounded memory or reach S3/document processing. |
-| Report durability — `DataHandling/server.py`, `app/jobs/reports.py` | `asyncio.create_task(_run_ocr_and_update())` existed only inside the API process. | `job = build_report_job(...)` followed by `report_jobs_collection.insert_one(job)`; workers claim jobs using leases and retries. | Report work survives request completion and process restarts, and stale workers cannot overwrite newer results. |
-| Clinical escalation — `server.py`, `app/clinical/escalation.py` | There was no deterministic pre-AI urgent-risk gate. | `_escalation = assess_urgent_risk(text_input, ...)` sends `clinical_escalation` and closes with code `4003`. | Urgent warning signs take a fixed safety route before normal AI interview processing continues. |
-| MongoDB TLS — `app/db/connection.py`, `app/db/mongo.py` | Modules created `MongoClient(...)` independently. | `validate_mongo_tls_options(uri)` then `MongoClient(uri, **build_verified_mongo_options(...))`. | Connection creation is centralized and refuses options that disable certificate or hostname verification. |
-| Frontend endpoint configuration — frontend `src/config/api.ts`, `vite.config.ts` | Runtime URLs/defaults were resolved in multiple places. | `resolveRuntimeEndpoints(...)` validates the required environment and API/WS/consent URL policy at build/startup. | Misconfigured deployments fail visibly instead of building a frontend that connects to the wrong service. |
-
-### How to demonstrate one item in a review
-
-Use the **Area and file** column to open the current implementation, search for
-the exact expression shown in **Now**, and explain the final column. If Git
-history is requested, the baseline can be displayed with:
-
-```bash
-git show d7db465^:DataHandling/server.py
+```python
+_interview_graph = build_interview_graph(...)
+graph_state = build_graph_state(client_state, text_input, _save_for_graph)
+result_state = await run_blocking(_interview_graph.invoke, graph_state)
 ```
 
-For frontend history, use the commit before its hardening change:
+**Meeting explanation:** “`server.py` transport/orchestration handle karta hai;
+business rules reusable `app/` modules aur interview workflow `src/graph/` mein
+separate hai.”
 
-```bash
-git -C ../customer-agent-frontend show e3cde01^:src/hooks/useWebSocket.ts
+## 2. Separate form attempt IDs
+
+**What and why:** Same patient ke repeated FRM-01/FRM-02 submissions ko separate
+records banane ke liye opaque `attemptId` add kiya, taaki previous assessment
+overwrite na ho.
+
+**Files:** `app/forms/attempts.py`, `server.py`
+
+```python
+ATTEMPT_INDEX_KEYS = [
+    ("userId", 1), ("formId", 1), ("attemptId", 1)
+]
+attempt_id = new_form_attempt_id()
 ```
 
-These commands are review references only; they do not modify the working tree.
+**Meeting explanation:** “`formId` questionnaire ko identify karta hai aur
+`attemptId` us questionnaire ki individual submission ko.”
 
-## 10. Important current-state clarifications
+## 3. Form lifecycle states
 
-- A separate customer-agent access-token system was initially implemented, but
-  it was intentionally removed after the product owner confirmed that the
-  existing OTP/consent integration must remain the active flow. Do not present
-  patient-link tokens as a current feature.
-- Direct public HTTP/IP support was added only for isolated development/UAT. It
-  is not the recommended production exposure model; production should use HTTPS,
-  WSS and the approved upstream boundary.
-- `context-layer/` was added by the earlier developer and later merged into this
-  branch. We reviewed and documented how it connects, but it should not be
-  presented as part of our optimization implementation.
+**What and why:** Form ki actual state track karne ke liye explicit lifecycle
+add ki: `draft`, `in_progress`, and `completed`.
 
-## 11. Short meeting summary
+**Files:** `app/forms/lifecycle.py`, `server.py`
 
-> We hardened the complete patient-intake path across frontend, WebSocket,
-> LangGraph, MongoDB and external AI services. The main results are isolated
-> patient sessions, correct form ownership and repeat-attempt storage, fewer and
-> safer AI calls, reliable audio/report processing, privacy-safe monitoring,
-> prompt-leak and clinical-safety protection, cleaned deployment artifacts, and
-> regression coverage for the critical flows. We also added isolated backend and
-> frontend Docker deployment files for UAT without replacing production.
+```python
+DRAFT = "draft"
+IN_PROGRESS = "in_progress"
+COMPLETED = "completed"
+lifecycle = resolve_form_lifecycle(...)
+```
+
+**Meeting explanation:** “Status title ya incomplete data se guess nahi hota;
+central lifecycle function se consistently calculate hota hai.”
+
+## 4. Completed forms protected from cleanup
+
+**What and why:** Old cleanup title/creation date par dependent tha. Ab only
+expired drafts ko TTL delete kar sakta hai; completed record ka `expiresAt`
+remove hota hai.
+
+**Files:** `app/forms/lifecycle.py`, `app/db/mongo.py`
+
+```python
+collection.create_index(
+    [("expiresAt", 1)],
+    expireAfterSeconds=0,
+    partialFilterExpression={"status": DRAFT},
+)
+```
+
+**Meeting explanation:** “Completed clinical record TTL condition match hi nahi
+karta, isliye draft cleanup usko remove nahi kar sakta.”
+
+## 5. Correct patient form update/delete queries
+
+**What and why:** Broad `formId` query ki jagah exact patient-owned document
+filter banaya, taaki another patient ka record update/delete na ho.
+
+**Files:** `app/db/ownership.py`, `app/db/queries.py`, `server.py`
+
+```python
+delete_filter = build_owned_form_filter(
+    existing_form, user_id_for_check, existing_form_id
+)
+await run_blocking(customer_info_collection.delete_one, delete_filter)
+```
+
+```python
+queries = build_user_form_queries(
+    user_id, form_id, attempt_id=attempt_id
+)
+```
+
+**Meeting explanation:** “Mutation se pehle stored document ownership verify
+hoti hai, and query patient + form + optional attempt tak scoped rehti hai.”
+
+## 6. Duplicate answers and reconnect handling
+
+**What and why:** Network retry, double click ya auto/manual send race se same
+answer twice process ho sakta tha. Frontend request ID bhejta hai and backend
+bounded idempotency window duplicate reject karta hai.
+
+**Files:** `app/ws/idempotency.py`, frontend `src/hooks/useWebSocket.ts`, frontend
+`src/components/TranscriptionInterface.tsx`
+
+```python
+_request_decision = _request_window.register(
+    client_state.get("user_id"),
+    data.get("requestId"),
+    data.get("questionId"),
+)
+if _request_decision is RequestDecision.DUPLICATE:
+    await websocket.send_text(json.dumps({
+        "type": "submission_ack",
+        "status": "duplicate",
+        "requestId": data.get("requestId"),
+    }))
+```
+
+```typescript
+sendTextInput(text, { requestId, questionId });
+```
+
+**Meeting explanation:** “Ek logical answer ka ek `requestId` hai, so resend ko
+acknowledge kiya jata hai but dobara extract/save nahi kiya jata.”
+
+## 7. Per-connection patient session state
+
+**What and why:** Shared mutable agent state concurrent patients ka data mix kar
+sakta tha. Ab `client_state` and active agent WebSocket handler ke andar create
+hote hain.
+
+**File:** `server.py`
+
+```python
+@app.websocket("/ws/{client_id}")
+async def websocket_endpoint(websocket: WebSocket, client_id: str):
+    health_agent = await run_blocking(HealthAgent)
+    client_state = {
+        "user_id": None,
+        "form_id": None,
+        "attempt_id": None,
+        "received_audio_buffer": bytearray(),
+        # remaining graph/session fields
+    }
+```
+
+**Meeting explanation:** “Har socket ka independent interview form, phase,
+history, attempt and audio buffer hai.”
+
+## 8. Microphone duration and audio-size limits
+
+**What and why:** Unlimited recording server memory and STT cost exhaust kar
+sakti thi. Server recording duration, chunk size and accumulated byte count
+validate karta hai.
+
+**Files:** `app/audio/limits.py`, `server.py`, frontend
+`src/hooks/useVoiceRecorder.ts`
+
+```python
+limit_error = audio_limit_error(
+    current_bytes=len(received_audio_buffer),
+    incoming_bytes=len(audio_chunk),
+    elapsed_seconds=elapsed,
+    max_total_bytes=MAX_AUDIO_SESSION_BYTES,
+    max_duration_seconds=MAX_AUDIO_SESSION_SECONDS,
+)
+```
+
+**Meeting explanation:** “Frontend user experience ke liye recording stop karta
+hai; backend authoritative limits enforce karta hai.”
+
+## 9. Secure PDF/image upload validation
+
+**What and why:** Extension alone reliable nahi hoti. Streaming size, signature,
+MIME, total quota, PDF pages, image dimensions and pixel count validate kiye.
+
+**Files:** `app/uploads/reading.py`, `app/uploads/policy.py`, `server.py`
+
+```python
+file_bytes = await read_upload_bounded(file, max_bytes=read_limit)
+validate_upload_quotas(...)
+inspection = await run_blocking(
+    inspect_report_upload,
+    file_bytes,
+    filename,
+    file.content_type,
+)
+```
+
+`docscanner/service.py` ke andar `inspect_report_upload()`
+`validate_upload_identity()` and `validate_document_complexity()` call karta hai.
+
+**Meeting explanation:** “Invalid/oversized content S3 ya document AI tak pahunchne
+se pehle reject hota hai.”
+
+## 10. Durable report processing
+
+**What and why:** In-process background task server restart par lost ho sakti thi.
+Report jobs MongoDB mein persist hote hain and worker leases, retries and recovery
+use karta hai.
+
+**Files:** `app/jobs/reports.py`, `server.py`, `docscanner/service.py`
+
+```python
+job = build_report_job(...)
+await run_blocking(report_jobs_collection.insert_one, job)
+job = claim_report_job(report_jobs_collection, worker_id, ...)
+```
+
+**Meeting explanation:** “API response ke baad bhi job database mein rahti hai;
+failed/restarted worker ke baad another worker safely retry kar sakta hai.”
+
+## 11. Central Gemini model configuration
+
+**What and why:** Scattered/hardcoded model IDs ko one validated registry se
+replace kiya. Retired or unapproved models startup configuration mein fail hote
+hain.
+
+**File:** `app/ai/models.py`; consumers include `app/audio/stt.py`, `server.py`
+and `src/llm/`.
+
+```python
+MODEL_REGISTRY = build_model_registry(os.environ)
+model = MODEL_REGISTRY.audio
+```
+
+**Meeting explanation:** “Model upgrade ek reviewed registry change hai, random
+file-level string replacement nahi.”
+
+## 12. Unnecessary AI calls reduced
+
+**What and why:** Deterministic tasks ko LLM se remove kiya, especially form
+title creation and structured PROM paths. Isse latency, cost and nondeterminism
+reduce hua.
+
+**Files:** `app/forms/titles.py`, `app/forms/prom.py`, `server.py`,
+`src/graph/nodes/extract.py`
+
+```python
+form_title = build_form_title(form_data_copy, empty_title="New Form")
+structured_answers = parse_structured_prom_answers(
+    text_input, question_meta, data.get("inputMode")
+)
+```
+
+**Meeting explanation:** “AI sirf language/reasoning wale work ke liye use hota
+hai; simple title and already-structured answers deterministic code handle karta
+hai.”
+
+## 13. AI usage, latency and estimated-cost monitoring
+
+**What and why:** Provider usage measurable banane ke liye every important AI
+boundary par common tracking wrapper add kiya.
+
+**File:** `app/observability/ai_usage.py`; used by audio, LLM and document clients.
+
+```python
+response = tracked_ai_call(
+    provider="google_genai",
+    model=MODEL_REGISTRY.audio,
+    operation="audio_transcription",
+    call=provider_call,
+    usage_extractor=gemini_usage,
+)
+```
+
+**Meeting explanation:** “Per provider/model/operation calls, failures, latency,
+usage and configured-price-based estimated cost record hota hai.”
+
+## 14. Patient information removed from standard logs
+
+**What and why:** Raw user IDs, answers and exception strings normal logs mein
+PHI/secrets expose kar sakte the. Pseudonymous ID and exception type helpers add
+kiye.
+
+**File:** `app/observability/privacy.py` and backend logging call sites.
+
+```python
+_log.warning(
+    "internal_prompt_content_rejected",
+    subject=pseudonymous_id(user_id),
+)
+_log.error("operation_failed", error_type=error_type(exc))
+```
+
+**Meeting explanation:** “Operational event visible rehta hai, patient answer aur
+credential log nahi hota.”
+
+## 15. Deterministic clinical emergency escalation
+
+**What and why:** Urgent-risk messages normal generative interview se pass nahi
+hone chahiye. LLM calls se before deterministic gate add kiya and decision audit
+record persist hota hai.
+
+**Files:** `app/clinical/escalation.py`, `server.py`
+
+```python
+_escalation = assess_urgent_risk(text_input, ...)
+if _escalation is not None:
+    await websocket.send_text(clinical_escalation_message)
+    await websocket.close(code=4003)
+```
+
+**Meeting explanation:** “Known urgent signals fixed safety policy follow karte
+hain and normal interview immediately stop hota hai.”
+
+## 16. MongoDB TLS certificate validation
+
+**What and why:** Mongo connections centralized kiye and certificate/hostname
+verification disable karne wale URI options reject kiye.
+
+**Files:** `app/db/connection.py`, `app/db/mongo.py`, `server.py`
+
+```python
+validate_mongo_tls_options(uri)
+client = MongoClient(uri, **build_verified_mongo_options(...))
+```
+
+**Meeting explanation:** “Application insecure TLS override ke saath database
+connection start nahi karti.”
+
+## 17. PROM identity, metadata and structured answers
+
+**What and why:** PROM scoring ke liye question identity and administered version
+stable rehna zaroori hai. Snapshot, definition hash and structured answer
+validation add ki.
+
+**Files:** `app/forms/instruments.py`, `app/forms/prom.py`, `server.py`
+
+```python
+snapshot = build_prom_snapshot(
+    questions,
+    source_form_id=provided_form_id,
+    legacy_form_data=existing_prom_data,
+)
+answers = parse_structured_prom_answers(
+    text_input, question_meta, data.get("inputMode")
+)
+updated_snapshot = apply_prom_answers(snapshot, answers_by_question_id)
+```
+
+**Meeting explanation:** “Hum sirf current question bank par depend nahi karte;
+patient ko actually administered questions ka immutable snapshot save hota hai.”
+
+## 18. Repeated questions and correction detection
+
+**What and why:** Normal statements containing “actually”, “sorry” or “change”
+incorrectly correction route mein ja rahe the. Correction routing summary
+confirmation context tak restrict ki.
+
+**Files:** `src/graph/edges.py`, `src/graph/nodes/extract.py`,
+`src/graph/nodes/correction.py`, `src/graph/nodes/summary.py`,
+`src/graph/pure_functions/intent_detection.py`
+
+```python
+if intent == "request_change":
+    if correction_text:
+        return "detect_correction"
+```
+
+**Meeting explanation:** “Normal intake answer extraction mein correction keyword
+heuristic active nahi hai; explicit summary correction par hi correction node run
+hota hai.”
+
+## 19. Transcription system-prompt leakage barriers
+
+**What and why:** STT system instruction transcript ke saath return ho kar patient
+chat/clinical record mein save ho sakta tha. Prompt separation, detection,
+fallback/rejection and persistence scrubbing add ki.
+
+**Files:** `app/audio/stt.py`, `app/content_safety.py`, `server.py`
+
+```python
+config=GenerateContentConfig(
+    system_instruction=_GEMINI_STT_PROMPT,
+    temperature=0,
+)
+```
+
+```python
+if contains_internal_transcription_prompt(text):
+    raise ValueError("Transcription rejected by internal-content guard")
+
+clean_form, removed = scrub_internal_transcription_prompts(form)
+```
+
+**Meeting explanation:** “Provider output trusted data nahi hai; display and save
+se pehle internal-instruction signatures reject/scrub hoti hain.”
+
+## 20. Frontend WebSocket cleanup and duplicate prevention
+
+**What and why:** Unmounted screen ke sockets, timers and audio buffers resource
+leak/reconnect loop create kar rahe the. Mounted/socket identity checks and full
+cleanup add kiya.
+
+**Files:** frontend `src/hooks/useWebSocket.ts`,
+`src/components/TranscriptionInterface.tsx`, `src/hooks/useVoiceRecorder.ts`
+
+```typescript
+if (!isMountedRef.current || wsRef.current !== ws) return;
+if (event.code === 4003 || event.code === 1008) {
+  shouldReconnectRef.current = false;
+}
+```
+
+```typescript
+return () => {
+  isMountedRef.current = false;
+  clearTimeout(reconnectTimeoutRef.current);
+  audioBuffers.clear();
+  ws.close(1000, "Component unmounted");
+};
+```
+
+**Meeting explanation:** “Only current mounted component socket state update karta
+hai; permanent policy errors retry loop mein nahi jaate.”
+
+## 21. Frontend TypeScript, ESLint and dependency fixes
+
+**What and why:** Loose types, lint failures and vulnerable dependency versions
+resolve kiye so CI/build repeatable and dependency audit clean rahe.
+
+**Files:** frontend `eslint.config.js`, `package.json`, `package-lock.json`, and
+affected hooks/components.
+
+```bash
+npm run lint
+npm run build
+npm audit
+```
+
+**Meeting explanation:** “Frontend type-check/lint/build successfully validate
+kiya and both relevant npm audits zero known vulnerabilities report karte the at
+verification time.”
+
+## 22. Isolated backend and frontend Docker configuration
+
+**What and why:** Same server par UAT deploy ko existing prod/dev containers,
+ports and network se separate rakha.
+
+**Files:**
+
+- Backend: `docker-compose.dev-isolated.yml`
+- Backend image: `DataHandling/deployment/Dockerfile`
+- Frontend: `../customer-agent-frontend/docker-compose.dev-isolated.yml`
+- Frontend image: `../customer-agent-frontend/Dockerfile.dev`
+- Frontend Nginx: `../customer-agent-frontend/nginx.dev.conf`
+
+```yaml
+services:
+  customer-agent-dev-isolated:
+    ports:
+      - "0.0.0.0:8004:8000"
+```
+
+**Meeting explanation:** “UAT ka project name, container, host port and service
+configuration separate hai, so production container replace nahi hota.”
+
+## 23. Backend Docker image size reduction
+
+**What and why:** Multi-stage and allow-list runtime build se tests, credentials,
+local data, caches and build tools final image se remove kiye.
+
+**Files:** `DataHandling/deployment/Dockerfile`, `.dockerignore`
+
+```dockerfile
+FROM python:3.12-slim AS builder
+# build dependencies and wheels
+
+FROM python:3.12-slim AS runtime
+# copy only runtime dependencies and allow-listed application paths
+```
+
+**Result:** Measured image approximately **575 MB se 428 MB** hui.
+
+**Meeting explanation:** “Final container mein application run karne ke required
+artifacts hi hain, complete repository/build toolchain nahi.”
+
+## 24. Repository cleanup
+
+**What and why:** Generated audio/reports, caches, environment files, obsolete
+deployment scripts and unused artifacts Git/deployment scope se remove/exclude
+kiye.
+
+**Files:** root and `DataHandling` `.gitignore`/`.dockerignore`; frontend
+`.gitignore`, `.dockerignore`, `.vercelignore`.
+
+Removed examples include old `deployment/update.sh`, `update-fast.sh`, temporary
+token generator, stale outputs and unused frontend assets.
+
+**Meeting explanation:** “Repository mein source, reviewed configuration and
+documentation rehte hain; secrets/generated runtime output nahi.”
+
+## 25. Local, API, deployment and project-flow documentation
+
+**What and why:** Setup and runtime knowledge scattered tha. Current configuration,
+interfaces and operational steps explicit documents mein add kiye.
+
+**Files:**
+
+- `README.md`
+- `DataHandling/docs/README.md`
+- `DataHandling/docs/LOCAL_DEV.md`
+- `DataHandling/docs/PUBLIC_API.md`
+- `DataHandling/docs/DEPLOYMENT.md`
+- `DataHandling/docs/DEV_ISOLATED_DEPLOYMENT.md`
+- `DataHandling/docs/PROJECT_CHANGES_IMPLEMENTED.md`
+- `DataHandling/docs/IMPLEMENTATION_EXPLANATION_GUIDE.md`
+
+**Meeting explanation:** “Developer setup, REST/WebSocket contract, architecture
+and deployment procedure documented and reviewable hain.”
+
+## 26. Comprehensive regression tests
+
+**What and why:** Critical fixes ko future regression se protect karne ke liye
+focused unit/contract/source-boundary tests add kiye.
+
+**Folder:** `DataHandling/tests/`
+
+Important tests:
+
+- `test_db_ownership.py`, `test_db_queries.py`
+- `test_form_attempts.py`, `test_form_lifecycle.py`
+- `test_audio_limits.py`, `test_transcription_content_safety.py`
+- `test_upload_policy.py`, `test_report_jobs.py`
+- `test_prom_instruments.py`, `test_prom_structured.py`
+- `test_clinical_escalation.py`, `test_clinical_escalation_boundary.py`
+- `test_ws_idempotency.py`, `test_websocket_audio_auth_regression.py`
+- `test_ai_models.py`, `test_ai_usage.py`
+- `test_async_boundaries.py`, `test_container_contract.py`
+- `test_interview_correction_routing.py`
+
+```bash
+cd DataHandling
+pytest -q
+```
+
+**Meeting explanation:** “Tests individual helper behavior ke saath critical
+integration boundaries bhi assert karte hain, for example escalation must execute
+before AI and unsafe transcript must not reach persistence.”
+
+## 27. Context-layer assessment-test recommender
+
+> **Ownership clarification:** `context-layer/` earlier developer ne implement
+> kiya tha. Humne iska role and integration review/document kiya; ise apna original
+> optimization implementation present nahi karna hai.
+
+**Purpose:** Completed customer intake and clinical context ke basis par clinician
+assessment form ke liye relevant objective tests recommend karta hai.
+
+**Backend files:** `context-layer/` (separate service/container, normally port
+`8002`).
+
+**Dashboard integration:**
+
+- `stance-dashboard-frontend/src/app/(protected)/patients/[id]/timeline/page.tsx`
+- `stance-dashboard-frontend/src/utils/agentFormDataMapper.ts`
+- `stance-dashboard-frontend/next.config.ts`
+
+```typescript
+const params = new URLSearchParams({ userId, appointmentId, reportId });
+const response = await fetch(`/recommendations?${params}`);
+const assessmentData = mapAgentFormDataToAssessment(await response.json());
+```
+
+**Runtime flow:**
+
+```text
+Dashboard patient timeline
+  → GET /recommendations
+  → Next.js proxy
+  → context-layer service
+  → patient-derived recommended tests
+  → agentFormDataMapper
+  → NewReportForm objective-assessment section
+```
+
+**Meeting explanation:** “Context layer patient se questions ask nahi karta. It
+reads available context and recommends tests to the clinician. Question asking
+and answer persistence remain Customer Agent responsibilities.”
+
+---
+
+## Dashboard connection in one minute
+
+```text
+Dashboard creates/copies /{patientId}/FRM-01 link
+  → patient uses customer-agent-frontend
+  → frontend talks to DataHandling/server.py over WebSocket
+  → backend saves stance-dashboard.customer-info
+  → main GraphQL API exposes customerInfo/customerInfoList
+  → stance-dashboard-frontend displays the submitted form
+```
+
+For FRM-02:
+
+```text
+Dashboard Clinical Admin assigns/publishes questions
+  → Clinical API writes tagged-questions
+  → Customer Agent reads tagged-questions
+  → patient completes FRM-02
+  → result is saved to customer-info
+  → Dashboard reads it through GraphQL
+```
+
+The dashboard does **not** use the Customer Agent interview WebSocket directly.
+The patient-facing frontend uses that WebSocket; the dashboard reads saved intake
+results through GraphQL.
+
+## Final short summary for a meeting
+
+> “We hardened the complete patient intake path from browser and WebSocket to
+> LangGraph, AI providers and MongoDB. We added isolated session state, exact
+> patient/form/attempt ownership, lifecycle protection, duplicate submission
+> control, bounded audio/uploads, durable report jobs, centralized AI models and
+> usage tracking, privacy-safe logs, deterministic clinical escalation and prompt
+> leak protection. We also improved the frontend and deployment boundaries and
+> added regression coverage. The separately contributed context-layer service
+> recommends assessment tests and is consumed by the clinician dashboard.”
